@@ -1,19 +1,21 @@
 import datetime
 import json
+import math
 import os
 import signal
 
 import objc
 from AppKit import (
-    NSAlert,
-    NSAlertFirstButtonReturn,
     NSApplication,
     NSApplicationActivationPolicyAccessory,
     NSBackingStoreBuffered,
+    NSBezierPath,
     NSBorderlessWindowMask,
+    NSButton,
     NSColor,
     NSColorPanel,
     NSFont,
+    NSImage,
     NSMakeRect,
     NSMenu,
     NSMenuItem,
@@ -118,6 +120,52 @@ def nscolor_to_rgba(color):
     ]
 
 
+def create_menu_bar_icon():
+    """Draw a minimal black-and-white clock icon (template image)."""
+    s = 18
+    img = NSImage.alloc().initWithSize_((s, s))
+    img.lockFocus()
+
+    NSColor.blackColor().setStroke()
+    NSColor.blackColor().setFill()
+
+    cx, cy = s / 2, s / 2
+    r = (s - 2) / 2
+
+    # Outer circle
+    circle = NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(1, 1, s - 2, s - 2))
+    circle.setLineWidth_(1.5)
+    circle.stroke()
+
+    # Hour hand → 10 o'clock (300° clockwise from 12)
+    ha = math.radians(300)
+    hl = r * 0.48
+    hp = NSBezierPath.bezierPath()
+    hp.moveToPoint_((cx, cy))
+    hp.lineToPoint_((cx + hl * math.sin(ha), cy + hl * math.cos(ha)))
+    hp.setLineWidth_(2.0)
+    hp.stroke()
+
+    # Minute hand → 2 o'clock (60° clockwise from 12)
+    ma = math.radians(60)
+    ml = r * 0.72
+    mp = NSBezierPath.bezierPath()
+    mp.moveToPoint_((cx, cy))
+    mp.lineToPoint_((cx + ml * math.sin(ma), cy + ml * math.cos(ma)))
+    mp.setLineWidth_(1.3)
+    mp.stroke()
+
+    # Center dot
+    dot = NSBezierPath.bezierPathWithOvalInRect_(
+        NSMakeRect(cx - 1.2, cy - 1.2, 2.4, 2.4)
+    )
+    dot.fill()
+
+    img.unlockFocus()
+    img.setTemplate_(True)  # adapts to light/dark menu bar automatically
+    return img
+
+
 # ---------------------------------------------------------------------------
 # Draggable View
 # ---------------------------------------------------------------------------
@@ -183,6 +231,7 @@ class ClockController(NSObject):
         self._timer_remaining = 0   # seconds left
         self._timer_running = False  # actively counting down
         self._timer_active = False   # timer mode engaged (even if paused)
+        self._timerInputField = None
         return self
 
     # -- dimensions ---------------------------------------------------------
@@ -334,7 +383,7 @@ class ClockController(NSObject):
         self._statusItem = statusBar.statusItemWithLength_(
             NSVariableStatusItemLength
         )
-        self._statusItem.button().setTitle_("\u23f0")
+        self._statusItem.button().setImage_(create_menu_bar_icon())
         self._statusItem.setMenu_(self.buildContextMenu())
 
         # Observe color panel changes
@@ -432,20 +481,33 @@ class ClockController(NSObject):
         menu.addItem_(NSMenuItem.separatorItem())
         timerMenu = NSMenu.alloc().initWithTitle_("Timer")
 
-        setItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Set Timer\u2026", "showTimerInput:", "",
+        # Inline input row: [ HH:MM:SS ] [Start]
+        inputView = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 220, 28))
+        timerField = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(12, 4, 130, 22)
         )
-        setItem.setTarget_(self)
-        timerMenu.addItem_(setItem)
+        timerField.setFont_(NSFont.fontWithName_size_("Menlo", 13))
+        timerField.setPlaceholderString_("HH:MM:SS")
+        if self._timerInputField is not None:
+            timerField.setStringValue_(self._timerInputField.stringValue())
+        else:
+            timerField.setStringValue_("00:05:00")
+        inputView.addSubview_(timerField)
+        self._timerInputField = timerField
+
+        startBtn = NSButton.alloc().initWithFrame_(NSMakeRect(148, 3, 60, 24))
+        startBtn.setTitle_("Start")
+        startBtn.setBezelStyle_(1)  # rounded
+        startBtn.setFont_(NSFont.systemFontOfSize_(12))
+        startBtn.setTarget_(self)
+        startBtn.setAction_("timerStartFromInput:")
+        inputView.addSubview_(startBtn)
+
+        inputItem = NSMenuItem.alloc().init()
+        inputItem.setView_(inputView)
+        timerMenu.addItem_(inputItem)
 
         timerMenu.addItem_(NSMenuItem.separatorItem())
-
-        startItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Start", "timerStart:", "",
-        )
-        startItem.setTarget_(self)
-        startItem.setEnabled_(self._timer_active and not self._timer_running)
-        timerMenu.addItem_(startItem)
 
         pauseItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Pause", "timerPause:", "",
@@ -561,33 +623,20 @@ class ClockController(NSObject):
     # -- actions: timer -----------------------------------------------------
 
     @objc.typedSelector(b"v@:@")
-    def showTimerInput_(self, sender):
-        app = NSApplication.sharedApplication()
-        app.activateIgnoringOtherApps_(True)
-
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_("Set Timer")
-        alert.setInformativeText_("Enter duration (HH:MM:SS or MM:SS):")
-        alert.addButtonWithTitle_("Start")
-        alert.addButtonWithTitle_("Cancel")
-
-        inputField = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 200, 24))
-        inputField.setStringValue_("00:05:00")
-        alert.setAccessoryView_(inputField)
-
-        response = alert.runModal()
-        if response != NSAlertFirstButtonReturn:
+    def timerStartFromInput_(self, sender):
+        if self._timerInputField is None:
             return
-
-        text = inputField.stringValue().strip()
+        text = self._timerInputField.stringValue().strip()
         seconds = self._parseTimerInput(text)
         if seconds is None or seconds <= 0:
             return
-
         self._timer_total = seconds
         self._timer_remaining = seconds
         self._timer_active = True
         self._timer_running = True
+        # Close the menu
+        if self._statusItem and self._statusItem.menu():
+            self._statusItem.menu().cancelTracking()
         self._resizeWindowKeepCenter()
         self.refreshMenus()
 
@@ -606,12 +655,6 @@ class ClockController(NSObject):
         except ValueError:
             pass
         return None
-
-    @objc.typedSelector(b"v@:@")
-    def timerStart_(self, sender):
-        if self._timer_active and self._timer_remaining > 0:
-            self._timer_running = True
-            self.refreshMenus()
 
     @objc.typedSelector(b"v@:@")
     def timerPause_(self, sender):
