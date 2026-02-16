@@ -5,6 +5,7 @@ import os
 import signal
 
 import objc
+import psutil
 from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyAccessory,
@@ -45,7 +46,6 @@ BASE_WIDTH = 380
 BASE_HEIGHT = 80
 BASE_RADIUS = 12
 SUBTEXT_FONT_RATIO = 0.35
-SUBTEXT_HEIGHT_EXTRA = 1.5  # height multiplier when sub-text is visible
 PADDING = 20
 
 MIN_SCALE = 0.5
@@ -59,6 +59,7 @@ DEFAULT_CONFIG = {
     "position": None,
     "show_seconds": True,
     "show_time_subtext": True,
+    "show_network_stats": False,
 }
 
 BG_PRESETS = {
@@ -77,7 +78,7 @@ FG_PRESETS = {
 }
 
 # ---------------------------------------------------------------------------
-# Config helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -87,7 +88,6 @@ def load_config():
             cfg = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         cfg = {}
-    # Migrate old "size" key to "scale"
     if "size" in cfg and "scale" not in cfg:
         mapping = {"small": 0.5, "medium": 1.0, "large": 1.5}
         cfg["scale"] = mapping.get(cfg.pop("size"), 1.0)
@@ -120,6 +120,18 @@ def nscolor_to_rgba(color):
     ]
 
 
+def format_speed(bps):
+    """Format bytes-per-second into a human-readable string."""
+    if bps < 1024:
+        return f"{bps:.0f} B/s"
+    elif bps < 1024 * 1024:
+        return f"{bps / 1024:.1f} KB/s"
+    elif bps < 1024 * 1024 * 1024:
+        return f"{bps / (1024 * 1024):.1f} MB/s"
+    else:
+        return f"{bps / (1024 * 1024 * 1024):.2f} GB/s"
+
+
 def create_menu_bar_icon():
     """Draw a minimal black-and-white clock icon (template image)."""
     s = 18
@@ -132,12 +144,13 @@ def create_menu_bar_icon():
     cx, cy = s / 2, s / 2
     r = (s - 2) / 2
 
-    # Outer circle
-    circle = NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(1, 1, s - 2, s - 2))
+    circle = NSBezierPath.bezierPathWithOvalInRect_(
+        NSMakeRect(1, 1, s - 2, s - 2)
+    )
     circle.setLineWidth_(1.5)
     circle.stroke()
 
-    # Hour hand → 10 o'clock (300° clockwise from 12)
+    # Hour hand → 10 o'clock
     ha = math.radians(300)
     hl = r * 0.48
     hp = NSBezierPath.bezierPath()
@@ -146,7 +159,7 @@ def create_menu_bar_icon():
     hp.setLineWidth_(2.0)
     hp.stroke()
 
-    # Minute hand → 2 o'clock (60° clockwise from 12)
+    # Minute hand → 2 o'clock
     ma = math.radians(60)
     ml = r * 0.72
     mp = NSBezierPath.bezierPath()
@@ -155,14 +168,13 @@ def create_menu_bar_icon():
     mp.setLineWidth_(1.3)
     mp.stroke()
 
-    # Center dot
     dot = NSBezierPath.bezierPathWithOvalInRect_(
         NSMakeRect(cx - 1.2, cy - 1.2, 2.4, 2.4)
     )
     dot.fill()
 
     img.unlockFocus()
-    img.setTemplate_(True)  # adapts to light/dark menu bar automatically
+    img.setTemplate_(True)
     return img
 
 
@@ -223,15 +235,23 @@ class ClockController(NSObject):
         self._contentView = None
         self._mainLabel = None
         self._subLabel = None
+        self._netLabel = None
         self._statusItem = None
         self._config = load_config()
 
-        # Timer state (runtime only, not persisted)
-        self._timer_total = 0       # total seconds set by user
-        self._timer_remaining = 0   # seconds left
-        self._timer_running = False  # actively counting down
-        self._timer_active = False   # timer mode engaged (even if paused)
+        # Timer state (runtime only)
+        self._timer_total = 0
+        self._timer_remaining = 0
+        self._timer_running = False
+        self._timer_active = False
         self._timerInputField = None
+
+        # Network stats state
+        counters = psutil.net_io_counters()
+        self._last_bytes_sent = counters.bytes_sent
+        self._last_bytes_recv = counters.bytes_recv
+        self._net_up_speed = 0.0
+        self._net_down_speed = 0.0
         return self
 
     # -- dimensions ---------------------------------------------------------
@@ -248,12 +268,24 @@ class ClockController(NSObject):
             and self._config.get("show_time_subtext", True)
         )
 
+    def _showNetStats(self):
+        return self._config.get("show_network_stats", False)
+
+    def _extraLineCount(self):
+        n = 0
+        if self._showSubtext():
+            n += 1
+        if self._showNetStats():
+            n += 1
+        return n
+
     def _windowSize(self):
         s = self._config["scale"]
         w = int(BASE_WIDTH * s)
         h = int(BASE_HEIGHT * s)
-        if self._showSubtext():
-            h = int(h * SUBTEXT_HEIGHT_EXTRA)
+        extra = self._extraLineCount()
+        if extra > 0:
+            h = int(h * (1 + extra * 0.42))
         return w, h
 
     def _cornerRadius(self):
@@ -293,24 +325,15 @@ class ClockController(NSObject):
         )
         contentView.setWantsLayer_(True)
 
-        # Main time label
-        mainLabel = NSTextField.labelWithString_("")
-        mainLabel.setBackgroundColor_(NSColor.clearColor())
-        mainLabel.setBezeled_(False)
-        mainLabel.setEditable_(False)
-        mainLabel.setSelectable_(False)
-        mainLabel.setAlignment_(1)  # NSTextAlignmentCenter
-        contentView.addSubview_(mainLabel)
-
-        # Sub label (current time shown below timer)
-        subLabel = NSTextField.labelWithString_("")
-        subLabel.setBackgroundColor_(NSColor.clearColor())
-        subLabel.setBezeled_(False)
-        subLabel.setEditable_(False)
-        subLabel.setSelectable_(False)
-        subLabel.setAlignment_(1)
+        mainLabel = self._makeLabel()
+        subLabel = self._makeLabel()
         subLabel.setHidden_(True)
+        netLabel = self._makeLabel()
+        netLabel.setHidden_(True)
+
+        contentView.addSubview_(mainLabel)
         contentView.addSubview_(subLabel)
+        contentView.addSubview_(netLabel)
 
         window.setContentView_(contentView)
         window.orderFrontRegardless()
@@ -319,6 +342,7 @@ class ClockController(NSObject):
         self._contentView = contentView
         self._mainLabel = mainLabel
         self._subLabel = subLabel
+        self._netLabel = netLabel
 
         self._relayout()
         self.applyColors()
@@ -327,6 +351,16 @@ class ClockController(NSObject):
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             1.0, self, "tick", None, True,
         )
+
+    @staticmethod
+    def _makeLabel():
+        label = NSTextField.labelWithString_("")
+        label.setBackgroundColor_(NSColor.clearColor())
+        label.setBezeled_(False)
+        label.setEditable_(False)
+        label.setSelectable_(False)
+        label.setAlignment_(1)
+        return label
 
     # -- layout -------------------------------------------------------------
 
@@ -339,31 +373,37 @@ class ClockController(NSObject):
         self._contentView.setFrame_(NSMakeRect(0, 0, w, h))
         self._contentView.layer().setCornerRadius_(radius)
 
-        font = NSFont.fontWithName_size_("Menlo", font_size)
-        self._mainLabel.setFont_(font)
+        main_font = NSFont.fontWithName_size_("Menlo", font_size)
+        sub_font = NSFont.fontWithName_size_("Menlo", sub_font_size)
+
+        self._mainLabel.setFont_(main_font)
+        self._subLabel.setFont_(sub_font)
+        self._netLabel.setFont_(sub_font)
 
         show_sub = self._showSubtext()
+        show_net = self._showNetStats()
         self._subLabel.setHidden_(not show_sub)
+        self._netLabel.setHidden_(not show_net)
 
+        main_line_h = main_font.ascender() - main_font.descender() + main_font.leading()
+        sub_line_h = sub_font.ascender() - sub_font.descender() + sub_font.leading()
+        gap = max(2, int(font_size * 0.08))
+
+        # Build list of (line_height, label) from visual top to bottom
+        lines = [(main_line_h, self._mainLabel)]
         if show_sub:
-            sub_font = NSFont.fontWithName_size_("Menlo", sub_font_size)
-            self._subLabel.setFont_(sub_font)
+            lines.append((sub_line_h, self._subLabel))
+        if show_net:
+            lines.append((sub_line_h, self._netLabel))
 
-            sub_line_h = sub_font.ascender() - sub_font.descender() + sub_font.leading()
-            main_line_h = font.ascender() - font.descender() + font.leading()
-            gap = max(2, int(font_size * 0.08))
-            total_text_h = main_line_h + gap + sub_line_h
-            top_pad = (h - total_text_h) / 2
+        total_h = sum(lh for lh, _ in lines) + gap * (len(lines) - 1)
+        # In Cocoa, y=0 is bottom. Position stack from top down.
+        cursor_y = (h + total_h) / 2  # top of the first line
 
-            main_y = top_pad + sub_line_h + gap
-            self._mainLabel.setFrame_(NSMakeRect(0, 0, w, main_y + main_line_h))
-            sub_y = top_pad
-            self._subLabel.setFrame_(NSMakeRect(0, 0, w, sub_y + sub_line_h))
-        else:
-            # Vertically center the main label
-            line_h = font.ascender() - font.descender() + font.leading()
-            y_offset = (h - line_h) / 2
-            self._mainLabel.setFrame_(NSMakeRect(0, y_offset, w, line_h))
+        for line_h, label in lines:
+            cursor_y -= line_h
+            label.setFrame_(NSMakeRect(0, cursor_y, w, line_h))
+            cursor_y -= gap
 
     def _resizeWindowKeepCenter(self):
         w, h = self._windowSize()
@@ -386,7 +426,6 @@ class ClockController(NSObject):
         self._statusItem.button().setImage_(create_menu_bar_icon())
         self._statusItem.setMenu_(self.buildContextMenu())
 
-        # Observe color panel changes
         NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
             self, "colorPanelChanged:", "NSColorPanelColorDidChangeNotification", None,
         )
@@ -394,7 +433,7 @@ class ClockController(NSObject):
     def buildContextMenu(self):
         menu = NSMenu.alloc().initWithTitle_("FloatingClock")
 
-        # -- Size controls --------------------------------------------------
+        # -- Size -----------------------------------------------------------
         scale = self._config["scale"]
         sizeMenu = NSMenu.alloc().initWithTitle_("Size")
 
@@ -420,7 +459,7 @@ class ClockController(NSObject):
         sizeItem.setSubmenu_(sizeMenu)
         menu.addItem_(sizeItem)
 
-        # -- Background submenu ---------------------------------------------
+        # -- Background -----------------------------------------------------
         bgMenu = NSMenu.alloc().initWithTitle_("Background")
         for name, rgba in BG_PRESETS.items():
             item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -438,7 +477,7 @@ class ClockController(NSObject):
         bgItem.setSubmenu_(bgMenu)
         menu.addItem_(bgItem)
 
-        # -- Text color submenu ---------------------------------------------
+        # -- Text color -----------------------------------------------------
         fgMenu = NSMenu.alloc().initWithTitle_("Text Color")
         current_fg = self._config["fg_color"]
         for name, rgba in FG_PRESETS.items():
@@ -456,7 +495,6 @@ class ClockController(NSObject):
             "Custom\u2026", "openColorPicker:", "",
         )
         customItem.setTarget_(self)
-        # Mark custom if current fg doesn't match any preset
         if current_fg not in FG_PRESETS.values():
             customItem.setState_(NSOnState)
         fgMenu.addItem_(customItem)
@@ -477,11 +515,20 @@ class ClockController(NSObject):
             secItem.setState_(NSOnState)
         menu.addItem_(secItem)
 
-        # -- Timer submenu --------------------------------------------------
+        # -- Network Stats --------------------------------------------------
+        netItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Network Stats", "toggleNetStats:", "",
+        )
+        netItem.setTarget_(self)
+        if self._config.get("show_network_stats", False):
+            netItem.setState_(NSOnState)
+        menu.addItem_(netItem)
+
+        # -- Timer ----------------------------------------------------------
         menu.addItem_(NSMenuItem.separatorItem())
         timerMenu = NSMenu.alloc().initWithTitle_("Timer")
 
-        # Inline input row: [ HH:MM:SS ] [Start]
+        # Inline input row
         inputView = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 220, 28))
         timerField = NSTextField.alloc().initWithFrame_(
             NSMakeRect(12, 4, 130, 22)
@@ -497,7 +544,7 @@ class ClockController(NSObject):
 
         startBtn = NSButton.alloc().initWithFrame_(NSMakeRect(148, 3, 60, 24))
         startBtn.setTitle_("Start")
-        startBtn.setBezelStyle_(1)  # rounded
+        startBtn.setBezelStyle_(1)
         startBtn.setFont_(NSFont.systemFontOfSize_(12))
         startBtn.setTarget_(self)
         startBtn.setAction_("timerStartFromInput:")
@@ -561,8 +608,7 @@ class ClockController(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def scaleUp_(self, sender):
-        s = self._config["scale"]
-        s = min(MAX_SCALE, round(s + SCALE_STEP, 1))
+        s = min(MAX_SCALE, round(self._config["scale"] + SCALE_STEP, 1))
         self._config["scale"] = s
         save_config(self._config)
         self._resizeWindowKeepCenter()
@@ -570,8 +616,7 @@ class ClockController(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def scaleDown_(self, sender):
-        s = self._config["scale"]
-        s = max(MIN_SCALE, round(s - SCALE_STEP, 1))
+        s = max(MIN_SCALE, round(self._config["scale"] - SCALE_STEP, 1))
         self._config["scale"] = s
         save_config(self._config)
         self._resizeWindowKeepCenter()
@@ -581,16 +626,14 @@ class ClockController(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def changeBgColor_(self, sender):
-        name = sender.representedObject()
-        self._config["bg_color"] = list(BG_PRESETS[name])
+        self._config["bg_color"] = list(BG_PRESETS[sender.representedObject()])
         save_config(self._config)
         self.applyColors()
         self.refreshMenus()
 
     @objc.typedSelector(b"v@:@")
     def changeFgColor_(self, sender):
-        name = sender.representedObject()
-        self._config["fg_color"] = list(FG_PRESETS[name])
+        self._config["fg_color"] = list(FG_PRESETS[sender.representedObject()])
         save_config(self._config)
         self.applyColors()
         self.refreshMenus()
@@ -605,19 +648,27 @@ class ClockController(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def colorPanelChanged_(self, notification):
-        panel = notification.object()
-        rgba = nscolor_to_rgba(panel.color())
+        rgba = nscolor_to_rgba(notification.object().color())
         self._config["fg_color"] = rgba
         save_config(self._config)
         self.applyColors()
         self.refreshMenus()
 
-    # -- actions: seconds toggle --------------------------------------------
+    # -- actions: toggles ---------------------------------------------------
 
     @objc.typedSelector(b"v@:@")
     def toggleSeconds_(self, sender):
         self._config["show_seconds"] = not self._config["show_seconds"]
         save_config(self._config)
+        self.refreshMenus()
+
+    @objc.typedSelector(b"v@:@")
+    def toggleNetStats_(self, sender):
+        self._config["show_network_stats"] = not self._config.get(
+            "show_network_stats", False
+        )
+        save_config(self._config)
+        self._resizeWindowKeepCenter()
         self.refreshMenus()
 
     # -- actions: timer -----------------------------------------------------
@@ -634,7 +685,6 @@ class ClockController(NSObject):
         self._timer_remaining = seconds
         self._timer_active = True
         self._timer_running = True
-        # Close the menu
         if self._statusItem and self._statusItem.menu():
             self._statusItem.menu().cancelTracking()
         self._resizeWindowKeepCenter()
@@ -672,8 +722,9 @@ class ClockController(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def toggleSubtext_(self, sender):
-        cur = self._config.get("show_time_subtext", True)
-        self._config["show_time_subtext"] = not cur
+        self._config["show_time_subtext"] = not self._config.get(
+            "show_time_subtext", True
+        )
         save_config(self._config)
         self._resizeWindowKeepCenter()
         self.refreshMenus()
@@ -704,16 +755,16 @@ class ClockController(NSObject):
         )
         fg_color = rgba_to_nscolor(fg)
         self._mainLabel.setTextColor_(fg_color)
-        # Sub-text at 60% opacity of the main color
+        # Secondary labels at 60% opacity
         sub_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
             fg[0], fg[1], fg[2], fg[3] * 0.6,
         )
         self._subLabel.setTextColor_(sub_color)
+        self._netLabel.setTextColor_(sub_color)
 
     def refreshMenus(self):
-        newMenu = self.buildContextMenu()
         if self._statusItem is not None:
-            self._statusItem.setMenu_(newMenu)
+            self._statusItem.setMenu_(self.buildContextMenu())
 
     # -- tick (every second) ------------------------------------------------
 
@@ -722,6 +773,7 @@ class ClockController(NSObject):
         fmt = "%H:%M:%S" if show_secs else "%H:%M"
         now_str = datetime.datetime.now().strftime(fmt)
 
+        # -- update timer ---------------------------------------------------
         if self._timer_active:
             if self._timer_running and self._timer_remaining > 0:
                 self._timer_remaining -= 1
@@ -731,19 +783,29 @@ class ClockController(NSObject):
                     self.refreshMenus()
 
             rem = self._timer_remaining
-            th = rem // 3600
-            tm = (rem % 3600) // 60
-            ts = rem % 60
+            th, tm, ts = rem // 3600, (rem % 3600) // 60, rem % 60
             if show_secs:
-                timer_str = f"{th:02d}:{tm:02d}:{ts:02d}"
+                self._mainLabel.setStringValue_(f"{th:02d}:{tm:02d}:{ts:02d}")
             else:
-                timer_str = f"{th:02d}:{tm:02d}"
-            self._mainLabel.setStringValue_(timer_str)
+                self._mainLabel.setStringValue_(f"{th:02d}:{tm:02d}")
 
             if self._showSubtext():
                 self._subLabel.setStringValue_(now_str)
         else:
             self._mainLabel.setStringValue_(now_str)
+
+        # -- update network stats -------------------------------------------
+        if self._showNetStats():
+            counters = psutil.net_io_counters()
+            up = counters.bytes_sent - self._last_bytes_sent
+            down = counters.bytes_recv - self._last_bytes_recv
+            self._last_bytes_sent = counters.bytes_sent
+            self._last_bytes_recv = counters.bytes_recv
+            self._net_up_speed = up
+            self._net_down_speed = down
+            self._netLabel.setStringValue_(
+                f"\u2191 {format_speed(up)}  \u2193 {format_speed(down)}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -760,7 +822,6 @@ def main():
     controller.setupMenuBar()
     app.setDelegate_(controller)
 
-    # Ctrl+C support
     def handle_sigint(sig, frame):
         NSApplication.sharedApplication().terminate_(None)
 
