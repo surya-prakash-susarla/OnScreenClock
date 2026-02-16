@@ -2,7 +2,9 @@ import datetime
 import json
 import math
 import os
+import re
 import signal
+import subprocess
 
 import objc
 import psutil
@@ -60,6 +62,7 @@ DEFAULT_CONFIG = {
     "show_seconds": True,
     "show_time_subtext": True,
     "show_network_stats": False,
+    "show_system_stats": False,
 }
 
 BG_PRESETS = {
@@ -130,6 +133,24 @@ def format_speed(bps):
         return f"{bps / (1024 * 1024):.1f} MB/s"
     else:
         return f"{bps / (1024 * 1024 * 1024):.2f} GB/s"
+
+
+def read_gpu_utilization():
+    """Best-effort GPU utilization % via ioreg. Returns int or None."""
+    try:
+        out = subprocess.check_output(
+            ["ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
+            timeout=2,
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+        # Look for keys like "Device Utilization %" or "GPU Activity(%)"
+        for m in re.finditer(
+            r'"[^"]*[Uu]tilization[^"]*%?[^"]*"\s*=\s*(\d+)', out
+        ):
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
 
 
 def create_menu_bar_icon():
@@ -236,6 +257,7 @@ class ClockController(NSObject):
         self._mainLabel = None
         self._subLabel = None
         self._netLabel = None
+        self._sysLabel = None
         self._statusItem = None
         self._config = load_config()
 
@@ -252,6 +274,11 @@ class ClockController(NSObject):
         self._last_bytes_recv = counters.bytes_recv
         self._net_up_speed = 0.0
         self._net_down_speed = 0.0
+
+        # System stats state
+        psutil.cpu_percent(interval=None)  # prime the first reading
+        self._gpu_pct = None
+        self._tick_count = 0
         return self
 
     # -- dimensions ---------------------------------------------------------
@@ -271,11 +298,16 @@ class ClockController(NSObject):
     def _showNetStats(self):
         return self._config.get("show_network_stats", False)
 
+    def _showSysStats(self):
+        return self._config.get("show_system_stats", False)
+
     def _extraLineCount(self):
         n = 0
         if self._showSubtext():
             n += 1
         if self._showNetStats():
+            n += 1
+        if self._showSysStats():
             n += 1
         return n
 
@@ -330,10 +362,13 @@ class ClockController(NSObject):
         subLabel.setHidden_(True)
         netLabel = self._makeLabel()
         netLabel.setHidden_(True)
+        sysLabel = self._makeLabel()
+        sysLabel.setHidden_(True)
 
         contentView.addSubview_(mainLabel)
         contentView.addSubview_(subLabel)
         contentView.addSubview_(netLabel)
+        contentView.addSubview_(sysLabel)
 
         window.setContentView_(contentView)
         window.orderFrontRegardless()
@@ -343,6 +378,7 @@ class ClockController(NSObject):
         self._mainLabel = mainLabel
         self._subLabel = subLabel
         self._netLabel = netLabel
+        self._sysLabel = sysLabel
 
         self._relayout()
         self.applyColors()
@@ -379,11 +415,14 @@ class ClockController(NSObject):
         self._mainLabel.setFont_(main_font)
         self._subLabel.setFont_(sub_font)
         self._netLabel.setFont_(sub_font)
+        self._sysLabel.setFont_(sub_font)
 
         show_sub = self._showSubtext()
         show_net = self._showNetStats()
+        show_sys = self._showSysStats()
         self._subLabel.setHidden_(not show_sub)
         self._netLabel.setHidden_(not show_net)
+        self._sysLabel.setHidden_(not show_sys)
 
         main_line_h = main_font.ascender() - main_font.descender() + main_font.leading()
         sub_line_h = sub_font.ascender() - sub_font.descender() + sub_font.leading()
@@ -395,6 +434,8 @@ class ClockController(NSObject):
             lines.append((sub_line_h, self._subLabel))
         if show_net:
             lines.append((sub_line_h, self._netLabel))
+        if show_sys:
+            lines.append((sub_line_h, self._sysLabel))
 
         total_h = sum(lh for lh, _ in lines) + gap * (len(lines) - 1)
         # In Cocoa, y=0 is bottom. Position stack from top down.
@@ -523,6 +564,15 @@ class ClockController(NSObject):
         if self._config.get("show_network_stats", False):
             netItem.setState_(NSOnState)
         menu.addItem_(netItem)
+
+        # -- System Stats ---------------------------------------------------
+        sysItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "System Stats (CPU/MEM/GPU)", "toggleSysStats:", "",
+        )
+        sysItem.setTarget_(self)
+        if self._config.get("show_system_stats", False):
+            sysItem.setState_(NSOnState)
+        menu.addItem_(sysItem)
 
         # -- Timer ----------------------------------------------------------
         menu.addItem_(NSMenuItem.separatorItem())
@@ -671,6 +721,15 @@ class ClockController(NSObject):
         self._resizeWindowKeepCenter()
         self.refreshMenus()
 
+    @objc.typedSelector(b"v@:@")
+    def toggleSysStats_(self, sender):
+        self._config["show_system_stats"] = not self._config.get(
+            "show_system_stats", False
+        )
+        save_config(self._config)
+        self._resizeWindowKeepCenter()
+        self.refreshMenus()
+
     # -- actions: timer -----------------------------------------------------
 
     @objc.typedSelector(b"v@:@")
@@ -761,6 +820,7 @@ class ClockController(NSObject):
         )
         self._subLabel.setTextColor_(sub_color)
         self._netLabel.setTextColor_(sub_color)
+        self._sysLabel.setTextColor_(sub_color)
 
     def refreshMenus(self):
         if self._statusItem is not None:
@@ -769,6 +829,7 @@ class ClockController(NSObject):
     # -- tick (every second) ------------------------------------------------
 
     def tick(self):
+        self._tick_count += 1
         show_secs = self._config["show_seconds"]
         fmt = "%H:%M:%S" if show_secs else "%H:%M"
         now_str = datetime.datetime.now().strftime(fmt)
@@ -806,6 +867,18 @@ class ClockController(NSObject):
             self._netLabel.setStringValue_(
                 f"\u2191 {format_speed(up)}  \u2193 {format_speed(down)}"
             )
+
+        # -- update system stats --------------------------------------------
+        if self._showSysStats():
+            cpu = psutil.cpu_percent(interval=None)
+            mem = psutil.virtual_memory().percent
+            # Read GPU every 3 seconds (subprocess is expensive)
+            if self._tick_count % 3 == 0:
+                self._gpu_pct = read_gpu_utilization()
+            parts = [f"CPU {cpu:.0f}%", f"MEM {mem:.0f}%"]
+            if self._gpu_pct is not None:
+                parts.append(f"GPU {self._gpu_pct}%")
+            self._sysLabel.setStringValue_("  ".join(parts))
 
 
 # ---------------------------------------------------------------------------
