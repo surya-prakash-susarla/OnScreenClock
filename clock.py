@@ -52,7 +52,7 @@ PADDING = 20
 
 MIN_SCALE = 0.5
 MAX_SCALE = 4.0
-SCALE_STEP = 0.5
+SCALE_STEP = 0.25
 
 DEFAULT_CONFIG = {
     "scale": 1.0,
@@ -62,7 +62,9 @@ DEFAULT_CONFIG = {
     "show_seconds": True,
     "show_time_subtext": True,
     "show_network_stats": False,
-    "show_system_stats": False,
+    "show_cpu": False,
+    "show_mem": False,
+    "show_gpu": False,
 }
 
 BG_PRESETS = {
@@ -299,7 +301,11 @@ class ClockController(NSObject):
         return self._config.get("show_network_stats", False)
 
     def _showSysStats(self):
-        return self._config.get("show_system_stats", False)
+        return (
+            self._config.get("show_cpu", False)
+            or self._config.get("show_mem", False)
+            or self._config.get("show_gpu", False)
+        )
 
     def _extraLineCount(self):
         n = 0
@@ -495,7 +501,7 @@ class ClockController(NSObject):
         sizeMenu.addItem_(decItem)
 
         sizeItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            f"Size ({scale:.1f}x)", None, "",
+            f"Size ({scale:.2f}x)", None, "",
         )
         sizeItem.setSubmenu_(sizeMenu)
         menu.addItem_(sizeItem)
@@ -565,13 +571,37 @@ class ClockController(NSObject):
             netItem.setState_(NSOnState)
         menu.addItem_(netItem)
 
-        # -- System Stats ---------------------------------------------------
-        sysItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "System Stats (CPU/MEM/GPU)", "toggleSysStats:", "",
+        # -- System Stats submenu -------------------------------------------
+        sysMenu = NSMenu.alloc().initWithTitle_("System Stats")
+
+        cpuItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "CPU", "toggleCpu:", "",
         )
-        sysItem.setTarget_(self)
-        if self._config.get("show_system_stats", False):
-            sysItem.setState_(NSOnState)
+        cpuItem.setTarget_(self)
+        if self._config.get("show_cpu", False):
+            cpuItem.setState_(NSOnState)
+        sysMenu.addItem_(cpuItem)
+
+        memItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Memory", "toggleMem:", "",
+        )
+        memItem.setTarget_(self)
+        if self._config.get("show_mem", False):
+            memItem.setState_(NSOnState)
+        sysMenu.addItem_(memItem)
+
+        gpuItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "GPU", "toggleGpu:", "",
+        )
+        gpuItem.setTarget_(self)
+        if self._config.get("show_gpu", False):
+            gpuItem.setState_(NSOnState)
+        sysMenu.addItem_(gpuItem)
+
+        sysItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "System Stats", None, "",
+        )
+        sysItem.setSubmenu_(sysMenu)
         menu.addItem_(sysItem)
 
         # -- Timer ----------------------------------------------------------
@@ -658,7 +688,7 @@ class ClockController(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def scaleUp_(self, sender):
-        s = min(MAX_SCALE, round(self._config["scale"] + SCALE_STEP, 1))
+        s = min(MAX_SCALE, round(self._config["scale"] + SCALE_STEP, 2))
         self._config["scale"] = s
         save_config(self._config)
         self._resizeWindowKeepCenter()
@@ -666,7 +696,7 @@ class ClockController(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def scaleDown_(self, sender):
-        s = max(MIN_SCALE, round(self._config["scale"] - SCALE_STEP, 1))
+        s = max(MIN_SCALE, round(self._config["scale"] - SCALE_STEP, 2))
         self._config["scale"] = s
         save_config(self._config)
         self._resizeWindowKeepCenter()
@@ -722,10 +752,22 @@ class ClockController(NSObject):
         self.refreshMenus()
 
     @objc.typedSelector(b"v@:@")
-    def toggleSysStats_(self, sender):
-        self._config["show_system_stats"] = not self._config.get(
-            "show_system_stats", False
-        )
+    def toggleCpu_(self, sender):
+        self._config["show_cpu"] = not self._config.get("show_cpu", False)
+        save_config(self._config)
+        self._resizeWindowKeepCenter()
+        self.refreshMenus()
+
+    @objc.typedSelector(b"v@:@")
+    def toggleMem_(self, sender):
+        self._config["show_mem"] = not self._config.get("show_mem", False)
+        save_config(self._config)
+        self._resizeWindowKeepCenter()
+        self.refreshMenus()
+
+    @objc.typedSelector(b"v@:@")
+    def toggleGpu_(self, sender):
+        self._config["show_gpu"] = not self._config.get("show_gpu", False)
         save_config(self._config)
         self._resizeWindowKeepCenter()
         self.refreshMenus()
@@ -870,14 +912,16 @@ class ClockController(NSObject):
 
         # -- update system stats --------------------------------------------
         if self._showSysStats():
-            cpu = psutil.cpu_percent(interval=None)
-            mem = psutil.virtual_memory().percent
-            # Read GPU every 3 seconds (subprocess is expensive)
-            if self._tick_count % 3 == 0:
-                self._gpu_pct = read_gpu_utilization()
-            parts = [f"CPU {cpu:.0f}%", f"MEM {mem:.0f}%"]
-            if self._gpu_pct is not None:
-                parts.append(f"GPU {self._gpu_pct}%")
+            parts = []
+            if self._config.get("show_cpu", False):
+                parts.append(f"CPU {psutil.cpu_percent(interval=None):.0f}%")
+            if self._config.get("show_mem", False):
+                parts.append(f"MEM {psutil.virtual_memory().percent:.0f}%")
+            if self._config.get("show_gpu", False):
+                if self._tick_count % 3 == 0:
+                    self._gpu_pct = read_gpu_utilization()
+                if self._gpu_pct is not None:
+                    parts.append(f"GPU {self._gpu_pct}%")
             self._sysLabel.setStringValue_("  ".join(parts))
 
 
