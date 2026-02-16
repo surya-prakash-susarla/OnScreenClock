@@ -2,9 +2,11 @@ import datetime
 import json
 import math
 import os
+import plistlib
 import re
 import signal
 import subprocess
+import sys
 
 import objc
 import psutil
@@ -33,14 +35,17 @@ from AppKit import (
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
 )
-from Foundation import NSNotificationCenter, NSObject
+from Foundation import NSBundle, NSNotificationCenter, NSObject
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
+BUNDLE_ID = "com.suryaprakash.floatingclock"
 CONFIG_DIR = os.path.expanduser("~/.config/floating-clock")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+LAUNCHAGENT_DIR = os.path.expanduser("~/Library/LaunchAgents")
+LAUNCHAGENT_PATH = os.path.join(LAUNCHAGENT_DIR, f"{BUNDLE_ID}.plist")
 
 # Base dimensions at scale 1.0
 BASE_FONT = 48
@@ -199,6 +204,53 @@ def create_menu_bar_icon():
     img.unlockFocus()
     img.setTemplate_(True)
     return img
+
+
+def _get_app_executable():
+    """Return the path to use in the LaunchAgent."""
+    bundle = NSBundle.mainBundle()
+    exe = bundle.executablePath()
+    # When running as a .app bundle, executablePath points inside the .app
+    if exe and ".app/Contents/MacOS/" in exe:
+        return exe
+    # Dev mode: fall back to the current Python + script
+    return sys.executable + " " + os.path.abspath(__file__)
+
+
+def is_start_at_login():
+    return os.path.isfile(LAUNCHAGENT_PATH)
+
+
+def enable_start_at_login():
+    exe = _get_app_executable()
+    # If it's a single executable (app bundle), use as-is; otherwise split
+    if " " in exe:
+        parts = exe.split(" ", 1)
+        program_args = [parts[0], parts[1]]
+    else:
+        program_args = [exe]
+
+    plist = {
+        "Label": BUNDLE_ID,
+        "ProgramArguments": program_args,
+        "RunAtLoad": True,
+    }
+    os.makedirs(LAUNCHAGENT_DIR, exist_ok=True)
+    with open(LAUNCHAGENT_PATH, "wb") as f:
+        plistlib.dump(plist, f)
+    subprocess.run(
+        ["launchctl", "load", LAUNCHAGENT_PATH],
+        capture_output=True,
+    )
+
+
+def disable_start_at_login():
+    if os.path.isfile(LAUNCHAGENT_PATH):
+        subprocess.run(
+            ["launchctl", "unload", LAUNCHAGENT_PATH],
+            capture_output=True,
+        )
+        os.remove(LAUNCHAGENT_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +727,14 @@ class ClockController(NSObject):
         rpItem.setTarget_(self)
         menu.addItem_(rpItem)
 
+        loginItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Start at Login", "toggleStartAtLogin:", "",
+        )
+        loginItem.setTarget_(self)
+        if is_start_at_login():
+            loginItem.setState_(NSOnState)
+        menu.addItem_(loginItem)
+
         menu.addItem_(NSMenuItem.separatorItem())
 
         quitItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -828,6 +888,16 @@ class ClockController(NSObject):
         )
         save_config(self._config)
         self._resizeWindowKeepCenter()
+        self.refreshMenus()
+
+    # -- actions: start at login --------------------------------------------
+
+    @objc.typedSelector(b"v@:@")
+    def toggleStartAtLogin_(self, sender):
+        if is_start_at_login():
+            disable_start_at_login()
+        else:
+            enable_start_at_login()
         self.refreshMenus()
 
     # -- actions: position --------------------------------------------------
