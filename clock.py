@@ -70,6 +70,7 @@ DEFAULT_CONFIG = {
     "show_cpu": False,
     "show_mem": False,
     "show_gpu": False,
+    "use_24h": True,
 }
 
 BG_PRESETS = {
@@ -616,6 +617,16 @@ class ClockController(NSObject):
             secItem.setState_(NSOnState)
         menu.addItem_(secItem)
 
+        # -- 24-hour / 12-hour toggle ---------------------------------------
+        use_24h = self._config.get("use_24h", True)
+        tfItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "24-Hour Time" if use_24h else "12-Hour Time", "toggleTimeFormat:", "",
+        )
+        tfItem.setTarget_(self)
+        if use_24h:
+            tfItem.setState_(NSOnState)
+        menu.addItem_(tfItem)
+
         # -- Network Stats --------------------------------------------------
         netItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Network Stats", "toggleNetStats:", "",
@@ -817,6 +828,12 @@ class ClockController(NSObject):
         self.refreshMenus()
 
     @objc.typedSelector(b"v@:@")
+    def toggleTimeFormat_(self, sender):
+        self._config["use_24h"] = not self._config.get("use_24h", True)
+        save_config(self._config)
+        self.refreshMenus()
+
+    @objc.typedSelector(b"v@:@")
     def toggleNetStats_(self, sender):
         self._config["show_network_stats"] = not self._config.get(
             "show_network_stats", False
@@ -978,7 +995,11 @@ class ClockController(NSObject):
     def tick(self):
         self._tick_count += 1
         show_secs = self._config["show_seconds"]
-        fmt = "%H:%M:%S" if show_secs else "%H:%M"
+        use_24h = self._config.get("use_24h", True)
+        if use_24h:
+            fmt = "%H:%M:%S" if show_secs else "%H:%M"
+        else:
+            fmt = "%I:%M:%S %p" if show_secs else "%I:%M %p"
         now_str = datetime.datetime.now().strftime(fmt)
 
         # -- update timer ---------------------------------------------------
