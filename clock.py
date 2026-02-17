@@ -239,19 +239,38 @@ def enable_start_at_login():
     os.makedirs(LAUNCHAGENT_DIR, exist_ok=True)
     with open(LAUNCHAGENT_PATH, "wb") as f:
         plistlib.dump(plist, f)
-    subprocess.run(
-        ["launchctl", "load", LAUNCHAGENT_PATH],
-        capture_output=True,
-    )
 
 
 def disable_start_at_login():
     if os.path.isfile(LAUNCHAGENT_PATH):
-        subprocess.run(
-            ["launchctl", "unload", LAUNCHAGENT_PATH],
-            capture_output=True,
-        )
         os.remove(LAUNCHAGENT_PATH)
+
+
+LOCK_FILE = os.path.join(CONFIG_DIR, "pid.lock")
+
+
+def _acquire_instance_lock():
+    """Ensure only one instance runs. Returns True if lock acquired."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    # Check if an existing lock points to a live process
+    if os.path.isfile(LOCK_FILE):
+        try:
+            with open(LOCK_FILE) as f:
+                old_pid = int(f.read().strip())
+            os.kill(old_pid, 0)  # raises OSError if process doesn't exist
+            return False  # another instance is alive
+        except (OSError, ValueError):
+            pass  # stale lock or bad content, safe to overwrite
+    with open(LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def _release_instance_lock():
+    try:
+        os.remove(LOCK_FILE)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1066,6 +1085,13 @@ class ClockController(NSObject):
 
 
 def main():
+    if not _acquire_instance_lock():
+        print("FloatingClock is already running. Exiting.")
+        sys.exit(0)
+
+    import atexit
+    atexit.register(_release_instance_lock)
+
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
