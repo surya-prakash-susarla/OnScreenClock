@@ -320,6 +320,8 @@ class ClockController(NSObject):
         self._timer_remaining = 0
         self._timer_running = False
         self._timer_active = False
+        self._timer_finished = False
+        self._flash_on = True
         self._timerInputField = None
 
         # Network stats state
@@ -846,6 +848,9 @@ class ClockController(NSObject):
         self._timer_remaining = seconds
         self._timer_active = True
         self._timer_running = True
+        self._timer_finished = False
+        self._flash_on = True
+        self._mainLabel.setAlphaValue_(1.0)
         if self._statusItem and self._statusItem.menu():
             self._statusItem.menu().cancelTracking()
         self._resizeWindowKeepCenter()
@@ -876,8 +881,11 @@ class ClockController(NSObject):
     def timerReset_(self, sender):
         self._timer_running = False
         self._timer_active = False
+        self._timer_finished = False
         self._timer_remaining = 0
         self._timer_total = 0
+        self._flash_on = True
+        self._mainLabel.setAlphaValue_(1.0)
         self._resizeWindowKeepCenter()
         self.refreshMenus()
 
@@ -953,6 +961,7 @@ class ClockController(NSObject):
                 if self._timer_remaining <= 0:
                     self._timer_remaining = 0
                     self._timer_running = False
+                    self._timer_finished = True
                     self.refreshMenus()
 
             rem = self._timer_remaining
@@ -961,6 +970,14 @@ class ClockController(NSObject):
                 self._mainLabel.setStringValue_(f"{th:02d}:{tm:02d}:{ts:02d}")
             else:
                 self._mainLabel.setStringValue_(f"{th:02d}:{tm:02d}")
+
+            # Flash the display when timer is finished
+            if self._timer_finished:
+                self._flash_on = not self._flash_on
+                alpha = 1.0 if self._flash_on else 0.0
+                self._mainLabel.setAlphaValue_(alpha)
+            else:
+                self._mainLabel.setAlphaValue_(1.0)
 
             if self._showSubtext():
                 self._subLabel.setStringValue_(now_str)
