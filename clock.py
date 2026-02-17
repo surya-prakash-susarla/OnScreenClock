@@ -662,6 +662,18 @@ class ClockController(NSObject):
         menu.addItem_(NSMenuItem.separatorItem())
         timerMenu = NSMenu.alloc().initWithTitle_("Timer")
 
+        # Quick presets
+        presets = [("15 min", 15 * 60), ("30 min", 30 * 60),
+                   ("1 hour", 3600), ("2 hours", 7200), ("3 hours", 10800)]
+        for label, secs in presets:
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                label, "timerStartPreset:", "",
+            )
+            item.setTarget_(self)
+            item.setRepresentedObject_(secs)
+            timerMenu.addItem_(item)
+        timerMenu.addItem_(NSMenuItem.separatorItem())
+
         # Inline input row
         inputView = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 220, 28))
         timerField = NSTextField.alloc().initWithFrame_(
@@ -844,6 +856,21 @@ class ClockController(NSObject):
         seconds = self._parseTimerInput(text)
         if seconds is None or seconds <= 0:
             return
+        self._timer_total = seconds
+        self._timer_remaining = seconds
+        self._timer_active = True
+        self._timer_running = True
+        self._timer_finished = False
+        self._flash_on = True
+        self._mainLabel.setAlphaValue_(1.0)
+        if self._statusItem and self._statusItem.menu():
+            self._statusItem.menu().cancelTracking()
+        self._resizeWindowKeepCenter()
+        self.refreshMenus()
+
+    @objc.typedSelector(b"v@:@")
+    def timerStartPreset_(self, sender):
+        seconds = sender.representedObject()
         self._timer_total = seconds
         self._timer_remaining = seconds
         self._timer_active = True
