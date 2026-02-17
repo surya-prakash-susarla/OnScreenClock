@@ -1009,6 +1009,12 @@ class ClockController(NSObject):
         if self._statusItem is not None:
             self._statusItem.setMenu_(self.buildContextMenu())
 
+    # -- noop (keeps run loop alive for signal handling) ---------------------
+
+    @objc.typedSelector(b"v@:@")
+    def noop_(self, timer):
+        pass
+
     # -- tick (every second) ------------------------------------------------
 
     def tick(self):
@@ -1107,7 +1113,7 @@ def main():
 
     # Nudge the run loop so Python signal handlers fire
     NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-        0.5, controller, "tick", None, True,
+        0.5, controller, "noop:", None, True,
     )
 
     app.run()
