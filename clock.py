@@ -464,6 +464,16 @@ class ClockController(NSObject):
         self.applyColors()
         self.tick()
 
+        # Sync to the next whole-second boundary so the clock stays aligned
+        # with the system clock, then start the repeating 1-second timer.
+        frac = datetime.datetime.now().microsecond / 1_000_000
+        delay = 1.0 - frac if frac > 0 else 1.0
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            delay, self, "startAlignedTimer", None, False,
+        )
+
+    def startAlignedTimer(self):
+        self.tick()
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             1.0, self, "tick", None, True,
         )
